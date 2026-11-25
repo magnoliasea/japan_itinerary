@@ -28,6 +28,9 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          EXPEDIA_API_KEY: ${{ secrets.EXPEDIA_API_KEY }}
+          EXPEDIA_API_USERNAME: ${{ secrets.EXPEDIA_API_USERNAME }}
+          EXPEDIA_API_PASSWORD: ${{ secrets.EXPEDIA_API_PASSWORD }}
         run: python scripts/edit_atlas.py
       - name: Commit edit to actual HTML
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.request != '' }}
