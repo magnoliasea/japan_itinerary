@@ -1,24 +1,66 @@
 """Validate one user-approved activity edit; modify only embedded JSON, never executable HTML."""
-import os,json,re,pathlib,urllib.request,sys
+import os,json,re,pathlib,urllib.request,sys,copy
 P=pathlib.Path('index.html')
 FIELDS=['time','name','place','travel','hours','price','desc','tip','souvenir','options','url']
 def load_html():
  h=P.read_text(encoding='utf-8');m=re.search(r'(<script id="data" type="application/json">)(.*?)(</script>)',h,re.S)
  if not m:raise ValueError('Cannot find embedded itinerary data')
  return h,m,json.loads(m[2])
+def route_events(d,r,day):
+ if not (0<=r<len(d['variants']) and 0<=day<len(d['variants'][r]['order'])):raise ValueError('Unknown route/day')
+ variant=d['variants'][r];base=variant.get('baseRoute',r);k=variant['order'][day]
+ if type(base) is not int or not 0<=base<=4:raise ValueError('Unknown base route')
+ events=(d['ultimate'] if base==4 else d['days'])[k]['events']
+ # Match the Osaka-first browser's filtered event order.
+ if base==1 and k=='osaka':events=[e for e in events if e['name']!='Den Den Town']
+ return events
+
+def parse_id(d,ident):
+ if not isinstance(ident,str) or not re.fullmatch(r'\d{1,4}-\d{1,2}-\d{1,3}',ident):raise ValueError('Invalid activity identifier')
+ r,day,i=map(int,ident.split('-'));events=route_events(d,r,day)
+ if not 0<=i<len(events):raise ValueError('Unknown stop')
+ return r,day,i,events[i]
+
+def validate_patch(p,complete=False):
+ if not isinstance(p,dict) or not set(p)<=set(FIELDS) or (complete and set(p)!=set(FIELDS)) or any(not isinstance(v,str) or len(v)>6000 for v in p.values()):raise ValueError('Invalid activity patch')
+ p=dict(p)
+ if p.get('url') and not re.match(r'^https?://',p['url']):p['url']=''
+ return p
+
 def validate_request(req,d):
  if not isinstance(req,dict):raise ValueError('Invalid request')
  ident=req.get('id','');prompt=req.get('prompt','');cur=req.get('current',{})
- if not re.fullmatch(r'\d{1,2}-\d{1,2}-\d{1,2}',ident):raise ValueError('Invalid activity identifier')
- r,day,i=map(int,ident.split('-'))
- if not (0<=r<len(d['variants']) and 0<=day<len(d['variants'][r]['order'])):raise ValueError('Unknown route/day')
- k=d['variants'][r]['order'][day];events=(d['ultimate'] if r==4 else d['days'])[k]['events']
- if not 0<=i<len(events):raise ValueError('Unknown stop')
+ r,day,i,event=parse_id(d,ident)
  if not isinstance(prompt,str) or not 1<=len(prompt)<=3000:raise ValueError('Invalid edit prompt')
  if not isinstance(cur,dict):raise ValueError('Invalid stop context')
- cur={f:str(cur.get(f,events[i].get(f,'')))[:6000] for f in FIELDS}
- # Only data fields can be changed. User controls the workflow trigger via scoped GitHub token.
+ if type(req.get('copyItinerary',False)) is not bool:raise ValueError('Invalid copy mode')
+ cur={f:str(cur.get(f,d.get('edits',{}).get(ident,{}).get(f,event.get(f,''))))[:6000] for f in FIELDS}
  return ident,prompt,cur
+
+def copy_route(d,req,ident):
+ r,day,i,_=parse_id(d,ident);src=d['variants'][r];new_index=len(d['variants'])
+ if new_index>9999:raise ValueError('Too many itineraries')
+ name=req.get('copyName','')
+ if not isinstance(name,str) or len(name)>120:raise ValueError('Invalid itinerary name')
+ name=name.strip() or src['name'][:105]+' — copy';names={v['name'].casefold() for v in d['variants']};unique=name;n=2
+ while unique.casefold() in names:
+  suffix=f' ({n})';unique=name[:120-len(suffix)]+suffix;n+=1
+ request_id=req.get('requestId','')
+ if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9-]{8,100}',request_id):raise ValueError('Invalid copy request ID')
+ browser=req.get('localEdits',{})
+ if not isinstance(browser,dict) or len(browser)>500:raise ValueError('Invalid local edits')
+ # Copy all source route overlays, then apply the explicitly included browser-only overlays.
+ edits=d.setdefault('edits',{});overlays={k:copy.deepcopy(v) for k,v in edits.items() if k.startswith(f'{r}-')}
+ for k,p in browser.items():
+  rr,_,_,_=parse_id(d,k)
+  if rr!=r:raise ValueError('Copy may include only source itinerary edits')
+  overlays[k]={**overlays.get(k,{}),**validate_patch(p)}
+ v=copy.deepcopy(src);v.update(name=unique,tag='Custom copy',baseRoute=src.get('baseRoute',r),copiedFrom=src['name'],copyRequestId=request_id)
+ v['desc']=src['desc'] # keep route summary and city order
+ d['variants'].append(v)
+ for k,p in overlays.items():
+  _,dd,ii,_=parse_id(d,k);edits[f'{new_index}-{dd}-{ii}']=copy.deepcopy(p)
+ return f'{new_index}-{day}-{i}'
 
 def call_model(prompt,cur):
  key=os.environ.get('OPENAI_API_KEY');model=os.environ.get('OPENAI_MODEL') or 'gpt-4.1-mini'
@@ -31,9 +73,12 @@ def call_model(prompt,cur):
  if not txt:raise ValueError('No structured edit returned by model')
  return json.loads(txt)
 def apply_edit(req,edited=None):
- h,m,d=load_html();ident,prompt,cur=validate_request(req,d);patch=edited if edited is not None else call_model(prompt,cur)
- if not isinstance(patch,dict) or set(patch)!=set(FIELDS) or any(not isinstance(v,str) or len(v)>6000 for v in patch.values()):raise ValueError('Invalid model output')
- if patch['url'] and not re.match(r'^https?://',patch['url']):patch['url']=''
+ h,m,d=load_html();ident,prompt,cur=validate_request(req,d)
+ if req.get('copyItinerary') and any(v.get('copyRequestId')==req.get('requestId') for v in d['variants'] if v.get('copyRequestId')):
+  print('Copy already saved; no duplicate created');return
+ # Validate copy first in memory. No HTML is written if validation or model call fails.
+ if req.get('copyItinerary'):ident=copy_route(d,req,ident)
+ patch=validate_patch(edited if edited is not None else call_model(prompt,cur),complete=True)
  d.setdefault('edits',{})[ident]=patch
  # Escape markup so no text value can close the JSON script element.
  serialized=json.dumps(d,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
