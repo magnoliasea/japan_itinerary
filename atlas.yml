@@ -1,0 +1,59 @@
+name: Atlas edit and publish
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      request:
+        description: 'JSON edit request submitted by the atlas (leave blank to publish only)'
+        required: false
+        type: string
+        default: ''
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: atlas-publish
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Apply approved AI edit
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.request != '' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: python scripts/edit_atlas.py
+      - name: Commit edit to actual HTML
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.request != '' }}
+        run: |
+          git config user.name 'Japan Atlas editor'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.html
+          if ! git diff --cached --quiet; then
+            git commit -m 'Apply user-approved itinerary edit'
+            git push origin HEAD:main
+          fi
+      - uses: actions/configure-pages@v5
+      - name: Prepare public website
+        run: |
+          mkdir -p public
+          cp index.html public/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
