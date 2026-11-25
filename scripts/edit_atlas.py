@@ -1,5 +1,6 @@
 """Validate one user-approved activity edit; modify only embedded JSON, never executable HTML."""
 import os,json,re,pathlib,urllib.request,sys,copy
+from research_atlas import research_activity, research_hotels, save_data
 P=pathlib.Path('index.html')
 FIELDS=['time','name','place','travel','hours','price','desc','tip','souvenir','options','url']
 def load_html():
@@ -34,6 +35,7 @@ def validate_request(req,d):
  if not isinstance(prompt,str) or not 1<=len(prompt)<=3000:raise ValueError('Invalid edit prompt')
  if not isinstance(cur,dict):raise ValueError('Invalid stop context')
  if type(req.get('copyItinerary',False)) is not bool:raise ValueError('Invalid copy mode')
+ if type(req.get('webResearch',False)) is not bool:raise ValueError('Invalid web research mode')
  cur={f:str(cur.get(f,d.get('edits',{}).get(ident,{}).get(f,event.get(f,''))))[:6000] for f in FIELDS}
  return ident,prompt,cur
 
@@ -60,6 +62,9 @@ def copy_route(d,req,ident):
  d['variants'].append(v)
  for k,p in overlays.items():
   _,dd,ii,_=parse_id(d,k);edits[f'{new_index}-{dd}-{ii}']=copy.deepcopy(p)
+ research=d.setdefault('activityResearch',{})
+ for k,vv in list(research.items()):
+  if k.startswith(f'{r}-') and k not in browser:research[f'{new_index}-{k.split("-",1)[1]}']=copy.deepcopy(vv)
  orders=d.setdefault('activityOrders',{})
  for dd in range(len(src['order'])):
   k=f'{r}-{dd}'
@@ -107,8 +112,15 @@ def apply_edit(req,edited=None):
   print('Copy already saved; no duplicate created');return
  # Validate copy first in memory. No HTML is written if validation or model call fails.
  if req.get('copyItinerary'):ident=copy_route(d,req,ident)
- patch=validate_patch(edited if edited is not None else call_model(prompt,cur),complete=True)
+ report=None
+ if edited is None and req.get('webResearch'):
+  r,day,i,event=parse_id(d,ident);v=d['variants'][r]
+  patch,report=research_activity(prompt,cur,{'date':f'2027-01-{day+1:02d}','route':v['name'],'kind':event.get('kind'),'guests':2 if day==10 else 4,'day_area':v['order'][day]},FIELDS)
+ else:patch=edited if edited is not None else call_model(prompt,cur)
+ patch=validate_patch(patch,complete=True)
  d.setdefault('edits',{})[ident]=patch
+ if report:d.setdefault('activityResearch',{})[ident]=report
+ else:d.setdefault('activityResearch',{}).pop(ident,None)
  # Escape markup so no text value can close the JSON script element.
  serialized=json.dumps(d,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
  P.write_text(h[:m.start(2)]+serialized+h[m.end(2):],encoding='utf-8')
@@ -119,6 +131,8 @@ if __name__=='__main__':
   from refresh_hotels import apply_refresh
   apply_refresh(req)
  elif req.get('type')=='activity_order':apply_order(req)
+ elif req.get('type')=='hotel_web_research':
+  h,m,d=load_html();research_hotels(req,d);save_data(P,h,m,d)
  elif req.get('type')=='auto_hotel_refresh':
   from auto_refresh import refresh
   refresh(req)
