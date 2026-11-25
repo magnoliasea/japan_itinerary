@@ -10,9 +10,9 @@ def route_events(d,r,day):
  if not (0<=r<len(d['variants']) and 0<=day<len(d['variants'][r]['order'])):raise ValueError('Unknown route/day')
  variant=d['variants'][r];base=variant.get('baseRoute',r);k=variant['order'][day]
  if type(base) is not int or not 0<=base<=4:raise ValueError('Unknown base route')
- events=(d['ultimate'] if base==4 else d['days'])[k]['events']
+ events=(variant.get('snapshotDays') or (d['ultimate'] if base==4 else d['days']))[k]['events']
  # Match the Osaka-first browser's filtered event order.
- if base==1 and k=='osaka':events=[e for e in events if e['name']!='Den Den Town']
+ if not variant.get('snapshotDays') and base==1 and k=='osaka':events=[e for e in events if e['name']!='Den Den Town']
  return events
 
 def parse_id(d,ident):
@@ -60,7 +60,36 @@ def copy_route(d,req,ident):
  d['variants'].append(v)
  for k,p in overlays.items():
   _,dd,ii,_=parse_id(d,k);edits[f'{new_index}-{dd}-{ii}']=copy.deepcopy(p)
- return f'{new_index}-{day}-{i}'
+ orders=d.setdefault('activityOrders',{})
+ for dd in range(len(src['order'])):
+  k=f'{r}-{dd}'
+  if k in orders:orders[f'{new_index}-{dd}']=copy.deepcopy(orders[k])
+ for k,order in validate_orders(d,r,req.get('localOrders',{})).items():orders[f'{new_index}-{k.split('-')[1]}']=order
+ return f'{new_index}-{day}-{i}' 
+
+def validate_orders(d,r,orders):
+ if not isinstance(orders,dict) or len(orders)>11:raise ValueError('Invalid day orders')
+ out={}
+ for k,v in orders.items():
+  if not re.fullmatch(r'\d{1,4}-\d{1,2}',k):raise ValueError('Invalid day key')
+  rr,day=map(int,k.split('-'))
+  if rr!=r:raise ValueError('Order belongs to another route')
+  n=len(route_events(d,r,day))
+  if not isinstance(v,list) or any(type(i) is not int or not 0<=i<n for i in v) or len(set(v))!=len(v):raise ValueError('Invalid activity order')
+  out[k]=v.copy()
+ return out
+
+def apply_order(req):
+ h,m,d=load_html();ident=req.get('id');r,day,i,_=parse_id(d,ident)
+ if req.get('route')!=r or req.get('day')!=day or type(req.get('copyItinerary',False)) is not bool:raise ValueError('Route or day mismatch')
+ order=validate_orders(d,r,{f'{r}-{day}':req.get('order')})[f'{r}-{day}']
+ if req.get('copyItinerary'):
+  if any(v.get('copyRequestId')==req.get('requestId') for v in d['variants'] if v.get('copyRequestId')):return
+  new=copy_route(d,req,ident);r=int(new.split('-')[0])
+ d.setdefault('activityOrders',{})[f'{r}-{day}']=order
+ serialized=json.dumps(d,ensure_ascii=False,separators=(',',':')).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
+ P.write_text(h[:m.start(2)]+serialized+h[m.end(2):],encoding='utf-8')
+ print('Saved order',r,day)
 
 def call_model(prompt,cur):
  key=os.environ.get('OPENAI_API_KEY');model=os.environ.get('OPENAI_MODEL') or 'gpt-4.1-mini'
@@ -89,4 +118,8 @@ if __name__=='__main__':
  if req.get('type')=='hotel_refresh':
   from refresh_hotels import apply_refresh
   apply_refresh(req)
+ elif req.get('type')=='activity_order':apply_order(req)
+ elif req.get('type')=='auto_hotel_refresh':
+  from auto_refresh import refresh
+  refresh(req)
  else:apply_edit(req, req.get('manual'))
